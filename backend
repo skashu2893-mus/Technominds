@@ -1,1 +1,138 @@
+import streamlit as st
+import fitz  # PyMuPDF
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+import os
+import requests
+
+# ==== IBM Watsonx API Config ====
+IBM_API_KEY = os.getenv("IBM_API_KEY") or "YOUR_IBM_API_KEY"
+IBM_API_URL = os.getenv("IBM_API_URL") or "https://api.ibm.com/watsonx/v1/generate"
+
+# ==== Helpers ====
+
+def extract_text_from_pdf(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    texts = []
+    for page in doc:
+        texts.append(page.get_text("text"))
+    return "\n".join(texts)
+
+def chunk_text(text, chunk_size=500, overlap=50):
+    """Split text into overlapping chunks of roughly chunk_size words"""
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
+
+def embed_chunks(chunks, embedder):
+    embeddings = embedder.encode(chunks, convert_to_numpy=True)
+    return embeddings
+
+def build_faiss_index(embeddings):
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
+    return index
+
+def query_faiss_index(query, embedder, index, chunks, top_k=5):
+    query_emb = embedder.encode([query], convert_to_numpy=True)
+    D, I = index.search(query_emb, top_k)
+    results = [chunks[i] for i in I[0]]
+    return results
+
+def call_ibm_watsonx_api(question, context):
+    # Example IBM Watsonx API call - adapt to your API specs
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {IBM_API_KEY}",
+    }
+    data = {
+        "model": "mixtral-8x7b-instruct",
+        "prompt": f"Context:\n{context}\n\nQuestion: {question}\nAnswer:",
+        "max_tokens": 300,
+        "temperature": 0.2,
+        "top_p": 1.0,
+        "stop": ["\n\n"]
+    }
+    response = requests.post(IBM_API_URL, headers=headers, json=data)
+    if response.status_code == 200:
+        answer = response.json().get("generated_text") or response.json().get("choices", [{}])[0].get("text", "")
+        return answer.strip()
+    else:
+        return f"Error from IBM Watsonx API: {response.status_code} {response.text}"
+
+# ==== Streamlit App ====
+
+st.set_page_config(page_title="StudyMate - AI Academic Assistant", layout="wide")
+
+st.title("📚 StudyMate: AI Academic Assistant for PDFs")
+
+st.markdown("""
+Welcome! Upload your academic PDFs, ask questions in natural language, and get **direct, contextual answers**.
+""")
+
+# Sidebar for PDF upload
+st.sidebar.header("Upload Your PDFs")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
+
+if uploaded_files:
+    with st.spinner("Extracting and processing PDFs..."):
+        all_text = ""
+        for pdf_file in uploaded_files:
+            text = extract_text_from_pdf(pdf_file.read())
+            all_text += text + "\n\n"
+
+        # Chunk text
+        chunks = chunk_text(all_text)
+        st.sidebar.success(f"Extracted and chunked text into {len(chunks)} chunks.")
+
+        # Load embedder
+        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+        # Embed chunks
+        embeddings = embed_chunks(chunks, embedder)
+
+        # Build FAISS index
+        index = build_faiss_index(embeddings)
+
+    st.sidebar.markdown("---")
+    st.sidebar.write(f"Uploaded **{len(uploaded_files)}** PDFs")
+    for f in uploaded_files:
+        st.sidebar.write(f"- {f.name}")
+
+    # Question input
+    question = st.text_input("Ask a question about your study materials:", key="question_input")
+
+    if question:
+        with st.spinner("Searching for answers..."):
+            # Retrieve relevant chunks
+            relevant_chunks = query_faiss_index(question, embedder, index, chunks, top_k=5)
+            context = "\n\n---\n\n".join(relevant_chunks)
+
+            # Call IBM Watsonx to generate answer
+            answer = call_ibm_watsonx_api(question, context)
+
+        # Display Q&A nicely
+        st.markdown("### Your Question:")
+        st.markdown(f"> {question}")
+
+        st.markdown("### Answer:")
+        st.success(answer)
+
+        # Show referenced context
+        with st.expander("Show referenced context"):
+            for i, chunk in enumerate(relevant_chunks, 1):
+                st.markdown(f"**Chunk {i}:**")
+                st.write(chunk)
+
+else:
+    st.info("Please upload one or more PDF files from the sidebar to get started.")
 
